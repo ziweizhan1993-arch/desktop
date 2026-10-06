@@ -10,6 +10,7 @@
 #include "display.h"
 #include "secrets.h"
 #include "state.h"
+#include "tls.h"
 #include "ui.h"
 #include "weather.h"
 #include "web.h"
@@ -27,11 +28,31 @@ static void netTask(void*) {
   bambuBegin();
 
   uint32_t lastWifiRetry = millis();
+  bool noted = false;
   for (;;) {
-    if (WiFi.status() != WL_CONNECTED && millis() - lastWifiRetry > 15000) {
+    const bool up = WiFi.status() == WL_CONNECTED;
+    if (!up && millis() - lastWifiRetry > 15000) {
       lastWifiRetry = millis();
+      noted = false;
       Serial.println("[wifi] reconnecting");
       WiFi.disconnect();
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+    if (up && !noted) {
+      noted = true;
+      noteNetOk();
+      Serial.printf("[wifi] ip=%s rssi=%d heap=%u largest=%u\n", WiFi.localIP().toString().c_str(),
+                    WiFi.RSSI(), ESP.getFreeHeap(), (unsigned)tlsLargestBlock());
+    }
+    // 停在系统页时没有打印机或网页请求，不要因此反复重连 WiFi
+    const int page = uiPage();
+    const bool wantNet = page < kPrinterCount + 2;
+    if (up && wantNet && lastNetOkMs() && millis() - lastNetOkMs() > 60000) {
+      Serial.println("[wifi] 60s 没有成功的连接，重新连接");
+      noted = false;
+      noteNetOk();
+      WiFi.disconnect(false, false);
+      vTaskDelay(pdMS_TO_TICKS(300));
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     }
     bambuLoop();
@@ -39,13 +60,24 @@ static void netTask(void*) {
   }
 }
 
-// 天气和 Cursor 的 HTTPS 会占住调用它的任务。单独放一个任务，避免打印机连接被拖死。
+// 只更新当前这一页。打印机、Cursor、天气各用一条加密连接，同时开就会内存不足。
 static void fetchTask(void*) {
-  vTaskDelay(pdMS_TO_TICKS(8000));
+  int lastPage = -1;
   for (;;) {
-    cursorLoop();
-    weatherLoop();
-    vTaskDelay(pdMS_TO_TICKS(500));
+    const int page = uiPage();
+    if (page != lastPage) {
+      if (page == kPrinterCount) cursorKick();
+      else if (page == kPrinterCount + 1) weatherKick();
+      lastPage = page;
+    }
+    if (page == kPrinterCount || page == kPrinterCount + 1) {
+      for (int i = 0; i < 80 && bambuBusy(); ++i) vTaskDelay(pdMS_TO_TICKS(50));
+      if (!bambuBusy() && uiPage() == page) {
+        if (page == kPrinterCount) cursorLoop();
+        else weatherLoop();
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
   }
 }
 
@@ -136,7 +168,8 @@ void setup() {
   Serial.println("no display attached, UI is rendered for web preview only; type 'help' for commands");
 #endif
 
-  xTaskCreatePinnedToCore(netTask, "net", 20480, nullptr, 1, nullptr, 0);
+  tlsInit();
+  xTaskCreatePinnedToCore(netTask, "net", 32768, nullptr, 1, nullptr, 0);
   xTaskCreatePinnedToCore(fetchTask, "fetch", 32768, nullptr, 1, nullptr, 0);
   webBegin();
   audioPlay(Sound::Boot);

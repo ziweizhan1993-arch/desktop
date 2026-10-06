@@ -11,6 +11,8 @@
 #include "config.h"
 #include "secrets.h"
 #include "state.h"
+#include "tls.h"
+#include "ui.h"
 
 struct PrinterConfig {
   const char* name;
@@ -39,6 +41,7 @@ struct PrinterConn {
 
 static PrinterConn s_conns[kPrinterCount];
 static JsonDocument s_filter;
+static volatile bool s_connecting = false;
 
 static constexpr uint32_t kReconnectMinMs = 5000;
 static constexpr uint32_t kReconnectMaxMs = 60000;
@@ -157,8 +160,10 @@ void bambuBegin() {
     }
 
     c.net.setInsecure();  // 打印机使用自签名证书
-    c.net.setTimeout(4);
-    c.net.setHandshakeTimeout(4000);  // 一台连不上时，4 秒放弃，避免拖住另一台
+    // setTimeout / setHandshakeTimeout 的单位是秒，库内部会再乘 1000。
+    // 之前传了 4000，实际变成约 66 分钟。一台握手卡住时，另一台和网页请求都会跟着失败。
+    c.net.setTimeout(12);
+    c.net.setHandshakeTimeout(10);
     c.mqtt.setServer(cfg.ip, 8883);
     c.mqtt.setBufferSize(60000);  // pushall 完整报文可达数十 KB，分配在 PSRAM
     c.mqtt.setKeepAlive(30);
@@ -169,25 +174,54 @@ void bambuBegin() {
 
 static void loopOne(PrinterConn& c) {
   const PrinterConfig& cfg = kConfigs[c.idx];
+  if (uiPage() != c.idx) {
+    if (c.mqtt.connected()) c.mqtt.disconnect();
+    setConnected(c, false);
+    return;
+  }
   if (!c.mqtt.connected()) {
     setConnected(c, false);
     if (c.lastAttemptMs && millis() - c.lastAttemptMs < c.retryMs) return;
     c.lastAttemptMs = millis();
 
     const String clientId = "esp32dash-" + String((uint32_t)ESP.getEfuseMac(), HEX) + "-" + c.idx;
-    ESP_LOGE("bambu", "%s -> %s heap=%u", cfg.name, cfg.ip, ESP.getFreeHeap());
+    ESP_LOGE("bambu", "%s -> %s heap=%u largest=%u", cfg.name, cfg.ip, ESP.getFreeHeap(),
+             (unsigned)tlsLargestBlock());
     Serial.printf("[bambu:%s] connecting to %s ...\n", cfg.name, cfg.ip);
-    if (c.mqtt.connect(clientId.c_str(), "bblp", cfg.accessCode)) {
+    bool ok = false;
+    s_connecting = true;
+    {
+      TlsLock tls;
+      ok = c.mqtt.connect(clientId.c_str(), "bblp", cfg.accessCode);
+    }
+    s_connecting = false;
+    if (uiPage() != c.idx) {
+      if (c.mqtt.connected()) c.mqtt.disconnect();
+      setConnected(c, false);
+      return;
+    }
+    if (ok) {
+      noteNetOk();
       ESP_LOGE("bambu", "%s connected", cfg.name);
       Serial.printf("[bambu:%s] connected\n", cfg.name);
       c.mqtt.subscribe(c.reportTopic.c_str());
       requestPushall(c);
       setConnected(c, true);
+      {
+        StateLock lock;
+        g_printers[c.idx].failCode = 0;
+      }
       c.retryMs = kReconnectMinMs;
     } else {
       c.retryMs = constrain(c.retryMs * 2, kReconnectMinMs, kReconnectMaxMs);
-      ESP_LOGE("bambu", "%s failed rc=%d heap=%u", cfg.name, c.mqtt.state(), ESP.getFreeHeap());
-      Serial.printf("[bambu:%s] connect failed, rc=%d, retry in %lus\n", cfg.name, c.mqtt.state(),
+      const int rc = c.mqtt.state();
+      {
+        StateLock lock;
+        g_printers[c.idx].failCode = rc;
+      }
+      ESP_LOGE("bambu", "%s failed rc=%d heap=%u largest=%u", cfg.name, rc, ESP.getFreeHeap(),
+               (unsigned)tlsLargestBlock());
+      Serial.printf("[bambu:%s] connect failed, rc=%d, retry in %lus\n", cfg.name, rc,
                     (unsigned long)(c.retryMs / 1000));
     }
     return;
@@ -202,5 +236,23 @@ void bambuLoop() {
     for (auto& c : s_conns) setConnected(c, false);
     return;
   }
-  for (auto& c : s_conns) loopOne(c);
+  const int page = uiPage();
+  for (auto& c : s_conns) {
+    if (page != c.idx) {
+      if (c.mqtt.connected()) {
+        c.mqtt.disconnect();
+        setConnected(c, false);
+      }
+      continue;
+    }
+    loopOne(c);
+    if (c.mqtt.connected()) noteNetOk();
+  }
+}
+
+bool bambuBusy() {
+  if (s_connecting) return true;
+  for (auto& c : s_conns)
+    if (c.mqtt.connected()) return true;
+  return false;
 }

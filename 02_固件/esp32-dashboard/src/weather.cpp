@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include "state.h"
+#include "tls.h"
 
 static uint32_t s_nextFetchMs = 0;
 
@@ -43,25 +44,49 @@ static bool fetchWeather(WeatherState& out) {
                      "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
                      "&wind_speed_unit=ms&timezone=Asia%2FShanghai&forecast_days=3";
 
+  if (!tlsHeapOk()) {
+    out.error = "内存不足";
+    Serial.printf("[weather] skip, largest=%u\n", (unsigned)tlsLargestBlock());
+    return false;
+  }
+
+  IPAddress resolved;
+  if (!WiFi.hostByName("api.open-meteo.com", resolved)) {
+    out.error = "DNS 失败";
+    Serial.printf("[weather] dns failed, heap=%u\n", ESP.getFreeHeap());
+    return false;
+  }
+
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(8);
-  client.setHandshakeTimeout(8000);
+  // 单位是秒，库内部会再乘 1000
+  client.setTimeout(12);
+  client.setHandshakeTimeout(12);
   HTTPClient http;
-  http.setConnectTimeout(8000);
-  http.setTimeout(8000);
-  if (!http.begin(client, url)) {
-    out.error = "天气请求失败";
-    return false;
-  }
-  const int code = http.GET();
-  if (code != 200) {
-    out.error = "天气接口 HTTP " + String(code);
+  http.setConnectTimeout(12000);
+  http.setTimeout(12000);
+  String body;
+  int code = -1;
+  {
+    TlsLock tls;
+    if (!http.begin(client, url)) {
+      out.error = "天气请求失败";
+      return false;
+    }
+    code = http.GET();
+    if (code == 200) body = http.getString();
     http.end();
+  }
+  if (code != 200) {
+    char errbuf[80] = {};
+    const int tlsErr = client.lastError(errbuf, sizeof(errbuf));
+    Serial.printf("[weather] http=%d tls=%d (%s) heap=%u largest=%u\n", code, tlsErr, errbuf,
+                  ESP.getFreeHeap(), (unsigned)tlsLargestBlock());
+    if (code == -1 && (tlsErr == -32512 || !tlsHeapOk())) out.error = "内存不足";
+    else if (code == -1) out.error = "连不上天气服务器";
+    else out.error = "天气接口 HTTP " + String(code);
     return false;
   }
-  const String body = http.getString();
-  http.end();
   JsonDocument doc;
   const auto err = deserializeJson(doc, body);
   if (err) {
@@ -88,6 +113,8 @@ static bool fetchWeather(WeatherState& out) {
   return true;
 }
 
+void weatherKick() { s_nextFetchMs = 0; }
+
 void weatherLoop() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (s_nextFetchMs && (int32_t)(millis() - s_nextFetchMs) < 0) return;
@@ -102,6 +129,7 @@ void weatherLoop() {
   if (ok) {
     next.ok = true;
     next.lastUpdateMs = millis();
+    noteNetOk();
   }
   Serial.printf("[weather] ok=%d %.1fC code=%d %s\n", ok, next.temp, next.code, next.error.c_str());
   s_nextFetchMs = millis() + (ok ? WEATHER_REFRESH_MS : WEATHER_RETRY_MS);

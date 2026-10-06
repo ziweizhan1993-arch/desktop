@@ -8,6 +8,7 @@
 #include "config.h"
 #include "secrets.h"
 #include "state.h"
+#include "tls.h"
 
 // cursor.com 没有面向个人账号的公开 API，这里用的是网页仪表盘调用的内部接口，
 // 依赖浏览器登录 Cookie，接口格式随时可能变化。
@@ -36,33 +37,61 @@ static time_t parseTime(JsonVariantConst v) {
   return 0;
 }
 
-static int httpGet(const String& url, String& body) {
+static int httpGet(const String& url, String& body, String& error) {
+  if (!tlsHeapOk()) {
+    error = "内存不足";
+    Serial.printf("[cursor] skip, largest=%u\n", (unsigned)tlsLargestBlock());
+    return -1;
+  }
+
+  IPAddress resolved;
+  if (!WiFi.hostByName("cursor.com", resolved)) {
+    error = "DNS 失败";
+    Serial.printf("[cursor] dns failed, heap=%u\n", ESP.getFreeHeap());
+    return -1;
+  }
+
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(8);
-  client.setHandshakeTimeout(8000);
+  // 单位是秒，库内部会再乘 1000
+  client.setTimeout(12);
+  client.setHandshakeTimeout(12);
   HTTPClient http;
-  http.setConnectTimeout(8000);
-  http.setTimeout(8000);
+  http.setConnectTimeout(12000);
+  http.setTimeout(12000);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  if (!http.begin(client, url)) return -1;
-  http.addHeader("Cookie", String("WorkosCursorSessionToken=") + CURSOR_SESSION_TOKEN);
-  http.addHeader("User-Agent",
-                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                 "(KHTML, like Gecko) Chrome/126.0 Safari/537.36");
-  http.addHeader("Accept", "application/json");
-  http.addHeader("Referer", "https://cursor.com/dashboard");
-  const int code = http.GET();
-  if (code > 0) body = http.getString();
-  http.end();
+  int code = -1;
+  {
+    TlsLock tls;
+    if (!http.begin(client, url)) {
+      error = "请求失败";
+      return -1;
+    }
+    http.addHeader("Cookie", String("WorkosCursorSessionToken=") + CURSOR_SESSION_TOKEN);
+    http.addHeader("User-Agent",
+                   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0 Safari/537.36");
+    http.addHeader("Accept", "application/json");
+    http.addHeader("Referer", "https://cursor.com/dashboard");
+    code = http.GET();
+    if (code > 0) body = http.getString();
+    http.end();
+  }
+  if (code == -1 && error.isEmpty()) {
+    char errbuf[80] = {};
+    const int tlsErr = client.lastError(errbuf, sizeof(errbuf));
+    Serial.printf("[cursor] http=%d tls=%d (%s) heap=%u largest=%u\n", code, tlsErr, errbuf,
+                  ESP.getFreeHeap(), (unsigned)tlsLargestBlock());
+    error = (tlsErr == -32512 || !tlsHeapOk()) ? "内存不足" : "连不上 Cursor";
+  }
   return code;
 }
 
 static bool fetchSummary(CursorState& out) {
   String body;
-  const int code = httpGet("https://cursor.com/api/usage-summary", body);
+  const int code = httpGet("https://cursor.com/api/usage-summary", body, out.error);
   if (code != 200) {
-    out.error = "usage-summary HTTP " + String(code);
+    if (out.error.isEmpty()) out.error = "Cursor HTTP " + String(code);
     return false;
   }
   JsonDocument doc;
@@ -97,9 +126,11 @@ static bool fetchLegacy(CursorState& out) {
   if (sep <= 0) return false;
 
   String body;
-  const int code = httpGet("https://cursor.com/api/usage?user=" + token.substring(0, sep), body);
+  String err;
+  const int code = httpGet("https://cursor.com/api/usage?user=" + token.substring(0, sep), body, err);
   if (code != 200) {
-    out.error += ", usage HTTP " + String(code);
+    if (err.length()) out.error = err;
+    else out.error += " HTTP " + String(code);
     return false;
   }
   JsonDocument doc;
@@ -115,6 +146,8 @@ static bool fetchLegacy(CursorState& out) {
   out.cycleEnd = start ? start + 30L * 86400 : 0;
   return true;
 }
+
+void cursorKick() { s_nextFetchMs = 0; }
 
 void cursorLoop() {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -132,10 +165,17 @@ void cursorLoop() {
     next.error = "未设置 Cursor Cookie（secrets.h 中的 CURSOR_SESSION_TOKEN）";
     s_nextFetchMs = millis() + CURSOR_REFRESH_MS;
   } else {
-    next.ok = fetchSummary(next) || fetchLegacy(next);
+    next.ok = fetchSummary(next);
+    if (!next.ok) {
+      const String& e = next.error;
+      const bool transport =
+          e == "内存不足" || e == "DNS 失败" || e == "连不上 Cursor" || e == "请求失败";
+      if (!transport) next.ok = fetchLegacy(next);
+    }
     if (next.ok) {
       next.error = "";
       next.lastUpdateMs = millis();
+      noteNetOk();
     }
     Serial.printf("[cursor] ok=%d %s\n", next.ok, next.error.c_str());
     s_nextFetchMs = millis() + (next.ok ? CURSOR_REFRESH_MS : CURSOR_RETRY_MS);

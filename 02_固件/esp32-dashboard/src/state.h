@@ -13,6 +13,7 @@ struct PrinterState {
   bool hasChamber = true;
   bool connected = false;
   bool hasData = false;
+  int failCode = 0;  // MQTT 失败码，0 表示还没失败过
   String gcodeState = "UNKNOWN";
   int percent = 0;
   int remainingMin = 0;

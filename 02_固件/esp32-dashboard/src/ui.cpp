@@ -27,11 +27,8 @@ LV_FONT_DECLARE(font_cn_14);
 LV_FONT_DECLARE(font_cn_20);
 
 static constexpr int kPages = kPrinterCount + 3;
-static constexpr uint32_t kAutoPageMs = 30000;
 static lv_obj_t* s_dots[kPages];
-static lv_obj_t* s_tv;
-static int s_page = 0;
-static uint32_t s_idleSince = 0;
+static volatile int s_page = 0;
 
 struct PrinterPage {
   lv_obj_t *badge, *arc, *pct, *remain, *eta, *job;
@@ -466,12 +463,18 @@ static void updatePrinter(const PrinterPage& pg, const PrinterState& p) {
   if (p.connected) {
     lv_label_set_text_fmt(p_conn, LV_SYMBOL_OK " 已连接打印机 · %lu 秒前更新",
                           (unsigned long)((millis() - p.lastUpdateMs) / 1000));
+  } else if (WiFi.status() != WL_CONNECTED) {
+    lv_label_set_text(p_conn, LV_SYMBOL_WARNING " WiFi 未连接");
+  } else if (p.failCode == -2) {
+    lv_label_set_text(p_conn, LV_SYMBOL_WARNING " 连不上打印机");
+  } else if (p.failCode == -4) {
+    lv_label_set_text(p_conn, LV_SYMBOL_WARNING " 打印机无响应");
+  } else if (p.failCode == 4 || p.failCode == 5) {
+    lv_label_set_text(p_conn, LV_SYMBOL_WARNING " 访问码被拒绝");
+  } else if (p.failCode != 0) {
+    lv_label_set_text_fmt(p_conn, LV_SYMBOL_WARNING " 连接失败 %d", p.failCode);
   } else {
-    if (WiFi.status() == WL_CONNECTED) {
-      lv_label_set_text_fmt(p_conn, LV_SYMBOL_REFRESH " WiFi 已连接 · 正在连接 %s ...", p.ip);
-    } else {
-      lv_label_set_text(p_conn, LV_SYMBOL_WARNING " WiFi 未连接");
-    }
+    lv_label_set_text_fmt(p_conn, LV_SYMBOL_REFRESH " WiFi 已连接 · 正在连接 %s ...", p.ip);
   }
 }
 
@@ -523,10 +526,8 @@ static void updateSystem() {
   const uint32_t up = millis() / 1000;
   lv_label_set_text_fmt(s_uptime, "%lu小时%02lu分", (unsigned long)(up / 3600),
                         (unsigned long)((up % 3600) / 60));
-  lv_label_set_text_fmt(s_mem, "%lu KB", (unsigned long)(ESP.getFreePsram() / 1024));
+  lv_label_set_text_fmt(s_mem, "%lu KB", (unsigned long)(ESP.getFreeHeap() / 1024));
 }
-
-static void autoPage();
 
 static void uiTick(lv_timer_t*) {
   PrinterState printers[kPrinterCount];
@@ -548,45 +549,25 @@ static void uiTick(lv_timer_t*) {
   updateCursor(c);
   updateWeather(w);
   updateSystem();
-  autoPage();
-}
-
-static bool pointerDown() {
-  for (lv_indev_t* indev = lv_indev_get_next(nullptr); indev; indev = lv_indev_get_next(indev)) {
-    if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER && indev->proc.state == LV_INDEV_STATE_PR) return true;
-  }
-  return false;
-}
-
-static void autoPage() {
-  if (pointerDown()) {
-    s_idleSince = millis();
-    return;
-  }
-  if (s_idleSince == 0) s_idleSince = millis();
-  if (millis() - s_idleSince < kAutoPageMs) return;
-  s_page = (s_page + 1) % kPages;
-  lv_obj_set_tile_id(s_tv, s_page, 0, LV_ANIM_ON);
-  s_idleSince = millis();
 }
 
 static void onTileChanged(lv_event_t* e) {
   lv_obj_t* tile = lv_tileview_get_tile_act(lv_event_get_target(e));
   const int idx = lv_obj_get_index(tile);
   s_page = idx;
-  s_idleSince = millis();
   for (int i = 0; i < kPages; i++) {
     lv_obj_set_style_bg_color(s_dots[i], i == idx ? C_TEXT : C_DIM, 0);
     lv_obj_set_width(s_dots[i], i == idx ? 18 : 8);
   }
 }
 
+int uiPage() { return s_page; }
+
 void uiBegin() {
   lv_obj_t* scr = lv_scr_act();
   lv_obj_set_style_bg_color(scr, C_BG, 0);
 
-  s_tv = lv_tileview_create(scr);
-  lv_obj_t* tv = s_tv;
+  lv_obj_t* tv = lv_tileview_create(scr);
   lv_obj_set_style_bg_color(tv, C_BG, 0);
   lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);
   lv_obj_t* tiles[kPages];
